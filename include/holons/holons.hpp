@@ -1,10 +1,18 @@
 #pragma once
 
+#include <arpa/inet.h>
+#include <cstdio>
 #include <fstream>
+#include <netinet/in.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <tuple>
+#include <unistd.h>
+#include <variant>
 #include <vector>
 
 namespace holons {
@@ -28,6 +36,192 @@ inline std::string parse_flags(const std::vector<std::string> &args) {
       return "tcp://:" + args[i + 1];
   }
   return std::string(kDefaultURI);
+}
+
+/// Parsed transport URI.
+struct parsed_uri {
+  std::string raw;
+  std::string scheme;
+  std::string host;
+  int port = 0;
+  std::string path;
+  bool secure = false;
+};
+
+struct tcp_listener {
+  int fd = -1;
+  std::string host;
+  int port = 0;
+};
+
+struct unix_listener {
+  int fd = -1;
+  std::string path;
+};
+
+struct stdio_listener {
+  std::string address = "stdio://";
+};
+
+struct mem_listener {
+  std::string address = "mem://";
+};
+
+struct ws_listener {
+  std::string host;
+  int port = 0;
+  std::string path;
+  bool secure = false;
+};
+
+using listener =
+    std::variant<tcp_listener, unix_listener, stdio_listener, mem_listener,
+                 ws_listener>;
+
+inline std::tuple<std::string, int> split_host_port(const std::string &addr,
+                                                     int default_port) {
+  if (addr.empty())
+    return {"0.0.0.0", default_port};
+
+  auto pos = addr.rfind(':');
+  if (pos == std::string::npos)
+    return {addr, default_port};
+
+  std::string host = addr.substr(0, pos);
+  if (host.empty())
+    host = "0.0.0.0";
+  std::string port_text = addr.substr(pos + 1);
+  int port = port_text.empty() ? default_port : std::stoi(port_text);
+  return {host, port};
+}
+
+inline parsed_uri parse_uri(const std::string &uri) {
+  std::string s = scheme(uri);
+
+  if (s == "tcp") {
+    if (uri.rfind("tcp://", 0) != 0)
+      throw std::invalid_argument("invalid tcp URI: " + uri);
+    auto [host, port] = split_host_port(uri.substr(6), 9090);
+    return {uri, "tcp", host, port, "", false};
+  }
+
+  if (s == "unix") {
+    if (uri.rfind("unix://", 0) != 0)
+      throw std::invalid_argument("invalid unix URI: " + uri);
+    auto path = uri.substr(7);
+    if (path.empty())
+      throw std::invalid_argument("invalid unix URI: " + uri);
+    return {uri, "unix", "", 0, path, false};
+  }
+
+  if (s == "stdio") {
+    return {"stdio://", "stdio", "", 0, "", false};
+  }
+
+  if (s == "mem") {
+    return {uri.rfind("mem://", 0) == 0 ? uri : "mem://", "mem", "", 0, "",
+            false};
+  }
+
+  if (s == "ws" || s == "wss") {
+    bool secure = s == "wss";
+    std::string prefix = secure ? "wss://" : "ws://";
+    if (uri.rfind(prefix, 0) != 0)
+      throw std::invalid_argument("invalid ws URI: " + uri);
+
+    std::string trimmed = uri.substr(prefix.size());
+    auto slash = trimmed.find('/');
+    std::string addr = slash == std::string::npos ? trimmed : trimmed.substr(0, slash);
+    std::string path = slash == std::string::npos ? "/grpc" : trimmed.substr(slash);
+    if (path.empty())
+      path = "/grpc";
+
+    auto [host, port] = split_host_port(addr, secure ? 443 : 80);
+    return {uri, s, host, port, path, secure};
+  }
+
+  throw std::invalid_argument("unsupported transport URI: " + uri);
+}
+
+inline listener listen(const std::string &uri) {
+  auto parsed = parse_uri(uri);
+
+  if (parsed.scheme == "tcp") {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+      throw std::runtime_error("socket() failed");
+
+    int one = 1;
+    ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(parsed.port));
+    if (parsed.host == "0.0.0.0") {
+      addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (::inet_pton(AF_INET, parsed.host.c_str(), &addr.sin_addr) != 1) {
+      ::close(fd);
+      throw std::runtime_error("invalid tcp host: " + parsed.host);
+    }
+
+    if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+      ::close(fd);
+      throw std::runtime_error("bind() failed");
+    }
+    if (::listen(fd, 16) < 0) {
+      ::close(fd);
+      throw std::runtime_error("listen() failed");
+    }
+    return tcp_listener{fd, parsed.host, parsed.port};
+  }
+
+  if (parsed.scheme == "unix") {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0)
+      throw std::runtime_error("socket() failed");
+
+    ::unlink(parsed.path.c_str());
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", parsed.path.c_str());
+
+    if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+      ::close(fd);
+      throw std::runtime_error("bind(unix) failed");
+    }
+    if (::listen(fd, 16) < 0) {
+      ::close(fd);
+      throw std::runtime_error("listen(unix) failed");
+    }
+    return unix_listener{fd, parsed.path};
+  }
+
+  if (parsed.scheme == "stdio")
+    return stdio_listener{};
+  if (parsed.scheme == "mem")
+    return mem_listener{};
+  if (parsed.scheme == "ws" || parsed.scheme == "wss")
+    return ws_listener{parsed.host, parsed.port, parsed.path, parsed.secure};
+
+  throw std::invalid_argument("unsupported transport URI: " + uri);
+}
+
+inline void close_listener(listener &lis) {
+  if (auto *tcp = std::get_if<tcp_listener>(&lis)) {
+    if (tcp->fd >= 0) {
+      ::close(tcp->fd);
+      tcp->fd = -1;
+    }
+    return;
+  }
+  if (auto *unix_lis = std::get_if<unix_listener>(&lis)) {
+    if (unix_lis->fd >= 0) {
+      ::close(unix_lis->fd);
+      unix_lis->fd = -1;
+    }
+    if (!unix_lis->path.empty())
+      ::unlink(unix_lis->path.c_str());
+  }
 }
 
 /// Parsed holon identity from HOLON.md.

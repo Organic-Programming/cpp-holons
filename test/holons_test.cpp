@@ -2,6 +2,8 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 int main() {
   int passed = 0;
@@ -17,10 +19,74 @@ int main() {
   ++passed;
   assert(holons::scheme("ws://host:8080") == "ws");
   ++passed;
+  assert(holons::scheme("wss://host:443") == "wss");
+  ++passed;
 
   // --- default URI ---
   assert(holons::kDefaultURI == "tcp://:9090");
   ++passed;
+
+  // --- parse_uri ---
+  {
+    auto parsed = holons::parse_uri("wss://example.com:8443");
+    assert(parsed.scheme == "wss");
+    ++passed;
+    assert(parsed.host == "example.com");
+    ++passed;
+    assert(parsed.port == 8443);
+    ++passed;
+    assert(parsed.path == "/grpc");
+    ++passed;
+    assert(parsed.secure);
+    ++passed;
+  }
+
+  // --- listen tcp/ws/mem/stdio ---
+  {
+    auto lis = holons::listen("tcp://127.0.0.1:0");
+    auto *tcp = std::get_if<holons::tcp_listener>(&lis);
+    assert(tcp != nullptr);
+    ++passed;
+    sockaddr_in addr{};
+    socklen_t len = sizeof(addr);
+    int rc = ::getsockname(tcp->fd, reinterpret_cast<sockaddr *>(&addr), &len);
+    assert(rc == 0);
+    ++passed;
+    assert(ntohs(addr.sin_port) > 0);
+    ++passed;
+    holons::close_listener(lis);
+  }
+
+  {
+    auto stdio_lis = holons::listen("stdio://");
+    assert(std::holds_alternative<holons::stdio_listener>(stdio_lis));
+    ++passed;
+
+    auto mem_lis = holons::listen("mem://");
+    assert(std::holds_alternative<holons::mem_listener>(mem_lis));
+    ++passed;
+
+    auto ws_lis = holons::listen("ws://127.0.0.1:8080/holon");
+    auto *ws = std::get_if<holons::ws_listener>(&ws_lis);
+    assert(ws != nullptr);
+    ++passed;
+    assert(ws->host == "127.0.0.1");
+    ++passed;
+    assert(ws->port == 8080);
+    ++passed;
+    assert(ws->path == "/holon");
+    ++passed;
+    assert(!ws->secure);
+    ++passed;
+  }
+
+  // --- unsupported URI ---
+  try {
+    (void)holons::listen("ftp://host");
+    assert(false && "should have thrown");
+  } catch (const std::invalid_argument &) {
+    ++passed;
+  }
 
   // --- parse_flags ---
   assert(holons::parse_flags({"--listen", "tcp://:8080"}) == "tcp://:8080");
