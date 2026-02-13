@@ -2,16 +2,23 @@
 
 #include <arpa/inet.h>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <signal.h>
 #include <string>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace {
+
+using json = nlohmann::json;
 
 int connect_tcp(const std::string &host, int port) {
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -43,6 +50,425 @@ std::string make_temp_markdown_path() {
   std::string path = std::string(tmpl) + ".md";
   std::remove(tmpl);
   return path;
+}
+
+std::string resolve_go_binary() {
+  std::string preferred = "/Users/bpds/go/go1.25.1/bin/go";
+  if (::access(preferred.c_str(), X_OK) == 0) {
+    return preferred;
+  }
+  return "go";
+}
+
+std::string find_sdk_dir() {
+  char cwd[4096] = {0};
+  if (::getcwd(cwd, sizeof(cwd)) == nullptr) {
+    throw std::runtime_error("getcwd failed");
+  }
+
+  std::string dir(cwd);
+  for (int i = 0; i < 12; ++i) {
+    std::string candidate = dir + "/go-holons";
+    if (::access(candidate.c_str(), F_OK) == 0) {
+      return dir;
+    }
+    auto slash = dir.find_last_of('/');
+    if (slash == std::string::npos || slash == 0) {
+      break;
+    }
+    dir = dir.substr(0, slash);
+  }
+
+  throw std::runtime_error("unable to locate sdk directory containing go-holons");
+}
+
+bool read_line_with_timeout(int fd, std::string &out, int timeout_ms) {
+  out.clear();
+  int elapsed = 0;
+
+  while (elapsed < timeout_ms) {
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    int rc = ::poll(&pfd, 1, 100);
+    if (rc < 0) {
+      return false;
+    }
+    if (rc == 0) {
+      elapsed += 100;
+      continue;
+    }
+    if ((pfd.revents & POLLIN) == 0) {
+      continue;
+    }
+
+    char ch = '\0';
+    ssize_t n = ::read(fd, &ch, 1);
+    if (n <= 0) {
+      return false;
+    }
+    if (ch == '\n') {
+      return true;
+    }
+    out.push_back(ch);
+  }
+
+  return false;
+}
+
+std::string read_available(int fd) {
+  std::string out;
+  char buf[1024];
+
+  for (int i = 0; i < 20; ++i) {
+    pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    int rc = ::poll(&pfd, 1, 50);
+    if (rc <= 0 || (pfd.revents & POLLIN) == 0) {
+      if (!out.empty()) {
+        break;
+      }
+      continue;
+    }
+
+    ssize_t n = ::read(fd, buf, sizeof(buf));
+    if (n <= 0) {
+      break;
+    }
+    out.append(buf, static_cast<size_t>(n));
+  }
+
+  return out;
+}
+
+const char *kGoHolonRPCServerSource = R"GO(
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"nhooyr.io/websocket"
+)
+
+type rpcError struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
+type rpcMessage struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+func main() {
+	mode := "echo"
+	if len(os.Args) > 1 {
+		mode = os.Args[1]
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer ln.Close()
+
+	var heartbeatCount int64
+	var dropped int32
+
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+			Subprotocols:       []string{"holon-rpc"},
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			http.Error(w, "upgrade failed", http.StatusBadRequest)
+			return
+		}
+		defer c.CloseNow()
+
+		ctx := r.Context()
+		for {
+			_, data, err := c.Read(ctx)
+			if err != nil {
+				return
+			}
+
+			var msg rpcMessage
+			if err := json.Unmarshal(data, &msg); err != nil {
+				_ = writeError(ctx, c, nil, -32700, "parse error")
+				continue
+			}
+			if msg.JSONRPC != "2.0" {
+				_ = writeError(ctx, c, msg.ID, -32600, "invalid request")
+				continue
+			}
+			if msg.Method == "" {
+				continue
+			}
+
+			switch msg.Method {
+			case "rpc.heartbeat":
+				atomic.AddInt64(&heartbeatCount, 1)
+				_ = writeResult(ctx, c, msg.ID, map[string]interface{}{})
+			case "echo.v1.Echo/Ping":
+				var params map[string]interface{}
+				_ = json.Unmarshal(msg.Params, &params)
+				if params == nil {
+					params = map[string]interface{}{}
+				}
+				_ = writeResult(ctx, c, msg.ID, params)
+				if mode == "drop-once" && atomic.CompareAndSwapInt32(&dropped, 0, 1) {
+					time.Sleep(100 * time.Millisecond)
+					_ = c.Close(websocket.StatusNormalClosure, "drop once")
+					return
+				}
+			case "echo.v1.Echo/HeartbeatCount":
+				_ = writeResult(ctx, c, msg.ID, map[string]interface{}{"count": atomic.LoadInt64(&heartbeatCount)})
+			case "echo.v1.Echo/CallClient":
+				callID := "s1"
+				if err := writeRequest(ctx, c, callID, "client.v1.Client/Hello", map[string]interface{}{"name": "go"}); err != nil {
+					_ = writeError(ctx, c, msg.ID, 13, err.Error())
+					continue
+				}
+
+				innerResult, callErr := waitForResponse(ctx, c, callID)
+				if callErr != nil {
+					_ = writeError(ctx, c, msg.ID, 13, callErr.Error())
+					continue
+				}
+				_ = writeResult(ctx, c, msg.ID, innerResult)
+			default:
+				_ = writeError(ctx, c, msg.ID, -32601, fmt.Sprintf("method %q not found", msg.Method))
+			}
+		}
+	})
+
+	srv := &http.Server{Handler: h}
+	go func() {
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("server error: %v", err)
+		}
+	}()
+
+	fmt.Printf("ws://%s/rpc\n", ln.Addr().String())
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	<-sigCh
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+}
+
+func writeRequest(ctx context.Context, c *websocket.Conn, id interface{}, method string, params map[string]interface{}) error {
+	payload, err := json.Marshal(rpcMessage{
+		JSONRPC: "2.0",
+		ID:      id,
+		Method:  method,
+		Params:  mustRaw(params),
+	})
+	if err != nil {
+		return err
+	}
+	return c.Write(ctx, websocket.MessageText, payload)
+}
+
+func writeResult(ctx context.Context, c *websocket.Conn, id interface{}, result interface{}) error {
+	payload, err := json.Marshal(rpcMessage{
+		JSONRPC: "2.0",
+		ID:      id,
+		Result:  mustRaw(result),
+	})
+	if err != nil {
+		return err
+	}
+	return c.Write(ctx, websocket.MessageText, payload)
+}
+
+func writeError(ctx context.Context, c *websocket.Conn, id interface{}, code int, message string) error {
+	payload, err := json.Marshal(rpcMessage{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &rpcError{
+			Code:    code,
+			Message: message,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	return c.Write(ctx, websocket.MessageText, payload)
+}
+
+func waitForResponse(ctx context.Context, c *websocket.Conn, expectedID string) (map[string]interface{}, error) {
+	deadlineCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	for {
+		_, data, err := c.Read(deadlineCtx)
+		if err != nil {
+			return nil, err
+		}
+
+		var msg rpcMessage
+		if err := json.Unmarshal(data, &msg); err != nil {
+			continue
+		}
+
+		id, _ := msg.ID.(string)
+		if id != expectedID {
+			continue
+		}
+		if msg.Error != nil {
+			return nil, fmt.Errorf("client error: %d %s", msg.Error.Code, msg.Error.Message)
+		}
+		var out map[string]interface{}
+		if err := json.Unmarshal(msg.Result, &out); err != nil {
+			return nil, err
+		}
+		return out, nil
+	}
+}
+
+func mustRaw(v interface{}) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return json.RawMessage(b)
+}
+)GO";
+
+struct go_helper_server {
+  pid_t pid = -1;
+  int stdout_fd = -1;
+  int stderr_fd = -1;
+  std::string helper_path;
+
+  ~go_helper_server() {
+    if (pid > 0) {
+      ::kill(pid, SIGTERM);
+      int status = 0;
+      for (int i = 0; i < 50; ++i) {
+        pid_t rc = ::waitpid(pid, &status, WNOHANG);
+        if (rc == pid) {
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      }
+      if (::waitpid(pid, &status, WNOHANG) == 0) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+      }
+    }
+
+    if (stdout_fd >= 0) {
+      ::close(stdout_fd);
+    }
+    if (stderr_fd >= 0) {
+      ::close(stderr_fd);
+    }
+    if (!helper_path.empty()) {
+      std::remove(helper_path.c_str());
+    }
+  }
+};
+
+go_helper_server start_go_helper(const std::string &mode) {
+  auto sdk_dir = find_sdk_dir();
+  auto go_dir = sdk_dir + "/go-holons";
+
+  auto stamp = std::to_string(
+      std::chrono::high_resolution_clock::now().time_since_epoch().count());
+  std::string helper_path = go_dir + "/tmp-holonrpc-" + stamp + ".go";
+  {
+    std::ofstream out(helper_path);
+    out << kGoHolonRPCServerSource;
+  }
+
+  int out_pipe[2] = {-1, -1};
+  int err_pipe[2] = {-1, -1};
+  if (::pipe(out_pipe) != 0 || ::pipe(err_pipe) != 0) {
+    throw std::runtime_error("pipe() failed");
+  }
+
+  pid_t pid = ::fork();
+  if (pid < 0) {
+    throw std::runtime_error("fork() failed");
+  }
+
+  if (pid == 0) {
+    ::dup2(out_pipe[1], STDOUT_FILENO);
+    ::dup2(err_pipe[1], STDERR_FILENO);
+    ::close(out_pipe[0]);
+    ::close(out_pipe[1]);
+    ::close(err_pipe[0]);
+    ::close(err_pipe[1]);
+    ::chdir(go_dir.c_str());
+
+    auto go = resolve_go_binary();
+    std::vector<char *> argv;
+    argv.push_back(const_cast<char *>(go.c_str()));
+    argv.push_back(const_cast<char *>("run"));
+    argv.push_back(const_cast<char *>(helper_path.c_str()));
+    argv.push_back(const_cast<char *>(mode.c_str()));
+    argv.push_back(nullptr);
+    ::execvp(go.c_str(), argv.data());
+    std::perror("execvp");
+    ::_exit(127);
+  }
+
+  ::close(out_pipe[1]);
+  ::close(err_pipe[1]);
+
+  go_helper_server server;
+  server.pid = pid;
+  server.stdout_fd = out_pipe[0];
+  server.stderr_fd = err_pipe[0];
+  server.helper_path = helper_path;
+  return server;
+}
+
+template <typename Func> void with_go_helper(const std::string &mode, Func f) {
+  auto server = start_go_helper(mode);
+  std::string url;
+  if (!read_line_with_timeout(server.stdout_fd, url, 20000)) {
+    auto stderr_text = read_available(server.stderr_fd);
+    throw std::runtime_error("Go holon-rpc helper did not output URL: " +
+                             stderr_text);
+  }
+  f(url);
+}
+
+json invoke_eventually(holons::holon_rpc_client &client,
+                       const std::string &method, const json &params) {
+  std::exception_ptr last_error;
+  for (int i = 0; i < 40; ++i) {
+    try {
+      return client.invoke(method, params);
+    } catch (...) {
+      last_error = std::current_exception();
+      std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    }
+  }
+  if (last_error) {
+    std::rethrow_exception(last_error);
+  }
+  throw std::runtime_error("invoke eventually failed");
 }
 
 } // namespace
@@ -246,6 +672,64 @@ int main() {
       ++passed;
     }
     std::remove(path.c_str());
+  }
+
+  // --- holon-rpc client interop (Go helper) ---
+  {
+    with_go_helper("echo", [&](const std::string &url) {
+      holons::holon_rpc_client client(250, 250, 100, 400);
+      client.connect(url);
+      auto out =
+          client.invoke("echo.v1.Echo/Ping", json{{"message", "hello"}});
+      assert(out["message"].get<std::string>() == "hello");
+      ++passed;
+      client.close();
+    });
+  }
+
+  {
+    with_go_helper("echo", [&](const std::string &url) {
+      holons::holon_rpc_client client(250, 250, 100, 400);
+      client.register_handler("client.v1.Client/Hello",
+                              [](const json &params) -> json {
+                                std::string name =
+                                    params.value("name", std::string(""));
+                                return json{{"message", "hello " + name}};
+                              });
+
+      client.connect(url);
+      auto out = client.invoke("echo.v1.Echo/CallClient", json::object());
+      assert(out["message"].get<std::string>() == "hello go");
+      ++passed;
+      client.close();
+    });
+  }
+
+  {
+    with_go_helper("drop-once", [&](const std::string &url) {
+      holons::holon_rpc_client client(200, 200, 100, 400);
+      client.connect(url);
+
+      auto first =
+          client.invoke("echo.v1.Echo/Ping", json{{"message", "first"}});
+      assert(first["message"].get<std::string>() == "first");
+      ++passed;
+
+      std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+      auto second =
+          invoke_eventually(client, "echo.v1.Echo/Ping",
+                            json{{"message", "second"}});
+      assert(second["message"].get<std::string>() == "second");
+      ++passed;
+
+      auto hb = invoke_eventually(client, "echo.v1.Echo/HeartbeatCount",
+                                  json::object());
+      assert(hb["count"].get<int>() >= 1);
+      ++passed;
+
+      client.close();
+    });
   }
 
   std::printf("%d passed, 0 failed\n", passed);
