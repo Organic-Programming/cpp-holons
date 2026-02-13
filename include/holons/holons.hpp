@@ -1,7 +1,9 @@
 #pragma once
 
 #include <arpa/inet.h>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <netinet/in.h>
 #include <sstream>
@@ -61,10 +63,15 @@ struct unix_listener {
 
 struct stdio_listener {
   std::string address = "stdio://";
+  bool consumed = false;
 };
 
 struct mem_listener {
   std::string address = "mem://";
+  int server_fd = -1;
+  int client_fd = -1;
+  bool server_consumed = false;
+  bool client_consumed = false;
 };
 
 struct ws_listener {
@@ -77,6 +84,14 @@ struct ws_listener {
 using listener =
     std::variant<tcp_listener, unix_listener, stdio_listener, mem_listener,
                  ws_listener>;
+
+struct connection {
+  int read_fd = -1;
+  int write_fd = -1;
+  std::string scheme;
+  bool owns_read_fd = true;
+  bool owns_write_fd = true;
+};
 
 inline std::tuple<std::string, int> split_host_port(const std::string &addr,
                                                      int default_port) {
@@ -119,8 +134,9 @@ inline parsed_uri parse_uri(const std::string &uri) {
   }
 
   if (s == "mem") {
-    return {uri.rfind("mem://", 0) == 0 ? uri : "mem://", "mem", "", 0, "",
-            false};
+    std::string raw = uri.rfind("mem://", 0) == 0 ? uri : "mem://";
+    std::string name = raw.size() > 6 ? raw.substr(6) : "";
+    return {raw, "mem", "", 0, name, false};
   }
 
   if (s == "ws" || s == "wss") {
@@ -197,13 +213,102 @@ inline listener listen(const std::string &uri) {
   }
 
   if (parsed.scheme == "stdio")
-    return stdio_listener{};
-  if (parsed.scheme == "mem")
-    return mem_listener{};
+    return stdio_listener{parsed.raw, false};
+  if (parsed.scheme == "mem") {
+    int fds[2] = {-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
+      throw std::runtime_error("mem socketpair() failed");
+    }
+    return mem_listener{parsed.raw, fds[0], fds[1], false, false};
+  }
   if (parsed.scheme == "ws" || parsed.scheme == "wss")
     return ws_listener{parsed.host, parsed.port, parsed.path, parsed.secure};
 
   throw std::invalid_argument("unsupported transport URI: " + uri);
+}
+
+/// Accept one connection from a listener.
+/// - tcp/unix: OS socket accept
+/// - stdio: single connection over stdin/stdout
+/// - mem: server side of in-process pair
+inline connection accept(listener &lis) {
+  if (auto *tcp = std::get_if<tcp_listener>(&lis)) {
+    int fd = ::accept(tcp->fd, nullptr, nullptr);
+    if (fd < 0) {
+      throw std::runtime_error("accept(tcp) failed: " +
+                               std::string(std::strerror(errno)));
+    }
+    return connection{fd, fd, "tcp", true, true};
+  }
+
+  if (auto *unix_lis = std::get_if<unix_listener>(&lis)) {
+    int fd = ::accept(unix_lis->fd, nullptr, nullptr);
+    if (fd < 0) {
+      throw std::runtime_error("accept(unix) failed: " +
+                               std::string(std::strerror(errno)));
+    }
+    return connection{fd, fd, "unix", true, true};
+  }
+
+  if (auto *stdio = std::get_if<stdio_listener>(&lis)) {
+    if (stdio->consumed) {
+      throw std::runtime_error("stdio:// accepts exactly one connection");
+    }
+    stdio->consumed = true;
+    return connection{STDIN_FILENO, STDOUT_FILENO, "stdio", false, false};
+  }
+
+  if (auto *mem = std::get_if<mem_listener>(&lis)) {
+    if (mem->server_consumed || mem->server_fd < 0) {
+      throw std::runtime_error("mem:// server side already consumed");
+    }
+    mem->server_consumed = true;
+    int fd = mem->server_fd;
+    mem->server_fd = -1;
+    return connection{fd, fd, "mem", true, true};
+  }
+
+  if (std::holds_alternative<ws_listener>(lis)) {
+    throw std::runtime_error(
+        "ws/wss runtime accept is unsupported (metadata-only listener)");
+  }
+
+  throw std::runtime_error("listener variant cannot accept");
+}
+
+/// Dial the client side of a mem:// listener.
+inline connection mem_dial(listener &lis) {
+  auto *mem = std::get_if<mem_listener>(&lis);
+  if (mem == nullptr) {
+    throw std::invalid_argument("mem_dial() requires mem:// listener");
+  }
+  if (mem->client_consumed || mem->client_fd < 0) {
+    throw std::runtime_error("mem:// client side already consumed");
+  }
+  mem->client_consumed = true;
+  int fd = mem->client_fd;
+  mem->client_fd = -1;
+  return connection{fd, fd, "mem", true, true};
+}
+
+inline ssize_t conn_read(const connection &conn, void *buf, size_t n) {
+  return ::read(conn.read_fd, buf, n);
+}
+
+inline ssize_t conn_write(const connection &conn, const void *buf, size_t n) {
+  return ::write(conn.write_fd, buf, n);
+}
+
+inline void close_connection(connection &conn) {
+  if (conn.owns_read_fd && conn.read_fd >= 0) {
+    ::close(conn.read_fd);
+    conn.read_fd = -1;
+  }
+  if (conn.owns_write_fd && conn.write_fd >= 0 &&
+      conn.write_fd != conn.read_fd) {
+    ::close(conn.write_fd);
+    conn.write_fd = -1;
+  }
 }
 
 inline void close_listener(listener &lis) {
@@ -221,6 +326,17 @@ inline void close_listener(listener &lis) {
     }
     if (!unix_lis->path.empty())
       ::unlink(unix_lis->path.c_str());
+    return;
+  }
+  if (auto *mem = std::get_if<mem_listener>(&lis)) {
+    if (mem->server_fd >= 0) {
+      ::close(mem->server_fd);
+      mem->server_fd = -1;
+    }
+    if (mem->client_fd >= 0) {
+      ::close(mem->client_fd);
+      mem->client_fd = -1;
+    }
   }
 }
 
