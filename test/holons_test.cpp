@@ -516,6 +516,81 @@ template <typename Func> void with_go_helper(const std::string &mode, Func f) {
   f(url);
 }
 
+go_helper_server start_cpp_holonrpc_server(const std::string &bind_url,
+                                           bool once) {
+  auto sdk_dir = find_sdk_dir();
+  auto cpp_dir = sdk_dir + "/cpp-holons";
+
+  int out_pipe[2] = {-1, -1};
+  int err_pipe[2] = {-1, -1};
+  if (::pipe(out_pipe) != 0 || ::pipe(err_pipe) != 0) {
+    throw std::runtime_error("pipe() failed");
+  }
+
+  pid_t pid = ::fork();
+  if (pid < 0) {
+    throw std::runtime_error("fork() failed");
+  }
+
+  if (pid == 0) {
+    ::dup2(out_pipe[1], STDOUT_FILENO);
+    ::dup2(err_pipe[1], STDERR_FILENO);
+    ::close(out_pipe[0]);
+    ::close(out_pipe[1]);
+    ::close(err_pipe[0]);
+    ::close(err_pipe[1]);
+    ::chdir(cpp_dir.c_str());
+
+    std::vector<std::string> args;
+    args.emplace_back("./bin/holon-rpc-server");
+    if (once) {
+      args.emplace_back("--once");
+    }
+    args.emplace_back(bind_url);
+
+    std::vector<char *> argv;
+    argv.reserve(args.size() + 1);
+    for (auto &arg : args) {
+      argv.push_back(const_cast<char *>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    ::execv(args[0].c_str(), argv.data());
+    std::perror("execv");
+    ::_exit(127);
+  }
+
+  ::close(out_pipe[1]);
+  ::close(err_pipe[1]);
+
+  go_helper_server server;
+  server.pid = pid;
+  server.stdout_fd = out_pipe[0];
+  server.stderr_fd = err_pipe[0];
+  return server;
+}
+
+template <typename Func> void with_cpp_holonrpc_server(Func f) {
+  auto server = start_cpp_holonrpc_server("ws://127.0.0.1:0/rpc", true);
+  std::string url;
+  if (!read_line_with_timeout(server.stdout_fd, url, 20000)) {
+    auto stderr_text = read_available(server.stderr_fd);
+    throw std::runtime_error(
+        "cpp holon-rpc server did not output URL: " + stderr_text);
+  }
+
+  f(url);
+
+  int status = 0;
+  if (::waitpid(server.pid, &status, 0) != server.pid) {
+    throw std::runtime_error("waitpid() failed for cpp holon-rpc server");
+  }
+  server.pid = -1;
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    throw std::runtime_error("cpp holon-rpc server exited with error");
+  }
+}
+
 json invoke_eventually(holons::holon_rpc_client &client,
                        const std::string &method, const json &params) {
   std::exception_ptr last_error;
@@ -551,9 +626,16 @@ int main() {
     assert(raw.find("\"echo_client\": \"./bin/echo-client\"") !=
            std::string::npos);
     ++passed;
+    assert(raw.find("\"holon_rpc_server\": \"./bin/holon-rpc-server\"") !=
+           std::string::npos);
+    ++passed;
     assert(raw.find("\"grpc_dial_tcp\": true") != std::string::npos);
     ++passed;
     assert(raw.find("\"grpc_dial_stdio\": true") != std::string::npos);
+    ++passed;
+    assert(raw.find("\"grpc_dial_ws\": true") != std::string::npos);
+    ++passed;
+    assert(raw.find("\"holon_rpc_server\": true") != std::string::npos);
     ++passed;
   }
 
@@ -563,9 +645,13 @@ int main() {
     ++passed;
     assert(::access("./bin/echo-server", F_OK) == 0);
     ++passed;
+    assert(::access("./bin/holon-rpc-server", F_OK) == 0);
+    ++passed;
     assert(::access("./bin/echo-client", X_OK) == 0);
     ++passed;
     assert(::access("./bin/echo-server", X_OK) == 0);
+    ++passed;
+    assert(::access("./bin/holon-rpc-server", X_OK) == 0);
     ++passed;
 
     char fake_go[] = "/tmp/holons_cpp_fake_go_XXXXXX";
@@ -682,6 +768,27 @@ int main() {
            capture.find("ARG6=stdio://") != std::string::npos);
     ++passed;
 
+    int holonrpc_exit = command_exit_code(
+        "./bin/holon-rpc-server ws://127.0.0.1:8080/rpc >/dev/null 2>&1");
+    assert(holonrpc_exit == 0);
+    ++passed;
+
+    capture = read_file_text(fake_log);
+    assert(!capture.empty());
+    ++passed;
+    assert(capture.find("PWD=") != std::string::npos &&
+           capture.find("/sdk/go-holons") != std::string::npos);
+    ++passed;
+    assert(capture.find("ARG0=run") != std::string::npos);
+    ++passed;
+    assert(capture.find("holon-rpc-server-go/main.go") != std::string::npos);
+    ++passed;
+    assert(capture.find("--sdk") != std::string::npos &&
+           capture.find("cpp-holons") != std::string::npos);
+    ++passed;
+    assert(capture.find("ws://127.0.0.1:8080/rpc") != std::string::npos);
+    ++passed;
+
     if (had_prev_go_bin) {
       ::setenv("GO_BIN", prev_go_bin_value.c_str(), 1);
     } else {
@@ -700,6 +807,26 @@ int main() {
 
     ::unlink(fake_go);
     ::unlink(fake_log);
+  }
+
+  // --- certification runtime transports ---
+  {
+    int mem_exit = command_exit_code(
+        "./bin/echo-client --message cert-mem mem:// >/dev/null 2>&1");
+    assert(mem_exit == 0);
+    ++passed;
+
+    if (bind_restricted) {
+      std::fprintf(stderr, "SKIP: echo-client ws:// (%s)\n",
+                   bind_reason.c_str());
+      ++passed;
+    } else {
+      int ws_exit = command_exit_code(
+          "./bin/echo-client --server-sdk cpp-holons --message cert-ws "
+          "ws://127.0.0.1:0/grpc >/dev/null 2>&1");
+      assert(ws_exit == 0);
+      ++passed;
+    }
   }
 
   // --- scheme ---
@@ -901,6 +1028,26 @@ int main() {
       ++passed;
     }
     std::remove(path.c_str());
+  }
+
+  // --- holon-rpc server interop (cpp wrapper) ---
+  if (bind_restricted) {
+    std::fprintf(stderr, "SKIP: holon-rpc server wrapper (%s)\n",
+                 bind_reason.c_str());
+    ++passed;
+  } else {
+    with_cpp_holonrpc_server([&](const std::string &url) {
+      holons::holon_rpc_client client(250, 250, 100, 400);
+      client.connect(url);
+      auto out =
+          client.invoke("echo.v1.Echo/Ping", json{{"message", "from-cpp"}});
+      assert(out["message"].get<std::string>() == "from-cpp");
+      ++passed;
+      assert(out["sdk"].get<std::string>() == "cpp-holons");
+      ++passed;
+      client.close();
+    });
+    ++passed;
   }
 
   // --- holon-rpc client interop (Go helper) ---
